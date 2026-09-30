@@ -196,15 +196,18 @@ TARGET_DIR="$SOURCE_DIR"
 printf 'Migrating the verified legacy installation in place: %s\n' "$TARGET_DIR"
 
 ACTIVE_PID=""
+LEGACY_RUNTIME_PIDS=()
 for proc in /proc/[0-9]*; do
   [[ -r "$proc/cmdline" ]] || continue
   cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
-  [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* && "$cmdline" != *"--worker"* ]] || continue
+  [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* ]] || continue
   cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
   exe_path="$(printf '%s' "$cmdline" | grep -oE "/[^ ]*/${CLOUD_EXECUTABLE}" | head -n 1 || true)"
   if [[ "$cwd" == "$TARGET_DIR" || ( -n "$exe_path" && "$(dirname "$exe_path")" == "$TARGET_DIR" ) ]]; then
-    ACTIVE_PID="${proc##*/}"
-    break
+    LEGACY_RUNTIME_PIDS+=("${proc##*/}")
+    if [[ -z "$ACTIVE_PID" || "$cmdline" != *"--worker"* ]]; then
+      ACTIVE_PID="${proc##*/}"
+    fi
   fi
 done
 
@@ -223,26 +226,115 @@ fi
 verify_secret_storage_continuity "$TARGET_DIR/config.toml" "$RUNNING_MASTER_KEY"
 verify_secret_storage_continuity "$TARGET_DIR/okx_futures.toml" "$RUNNING_MASTER_KEY"
 
+LEGACY_EXECUTABLE="$TARGET_DIR/$CLOUD_EXECUTABLE"
+LEGACY_EXECUTABLE_BACKUP="$TARGET_DIR/.${CLOUD_EXECUTABLE}.migration-backup"
+MIGRATION_SUCCEEDED=0
+restore_legacy_runtime_on_failure() {
+  local exit_code=$?
+  if [[ "$MIGRATION_SUCCEEDED" != "1" ]]; then
+    if [[ -f "$LEGACY_EXECUTABLE_BACKUP" && ! -e "$LEGACY_EXECUTABLE" ]]; then
+      mv -f "$LEGACY_EXECUTABLE_BACKUP" "$LEGACY_EXECUTABLE" || true
+      chmod 0755 "$LEGACY_EXECUTABLE" 2>/dev/null || true
+    fi
+  fi
+  exit "$exit_code"
+}
+trap restore_legacy_runtime_on_failure EXIT
+
+# Migration is deliberately offline. Rename the old executable before stopping
+# it so BaoTa cannot immediately relaunch the flat-layout runtime while its
+# SQLite files are being moved. A failed migration restores the executable.
+[[ ! -e "$LEGACY_EXECUTABLE_BACKUP" ]] || die "A previous migration backup still exists: $LEGACY_EXECUTABLE_BACKUP"
+mv "$LEGACY_EXECUTABLE" "$LEGACY_EXECUTABLE_BACKUP"
+for legacy_pid in "${LEGACY_RUNTIME_PIDS[@]}"; do
+  kill -TERM "$legacy_pid" 2>/dev/null || true
+done
+for ((attempt=0; attempt<60; attempt++)); do
+  remaining=0
+  for legacy_pid in "${LEGACY_RUNTIME_PIDS[@]}"; do
+    if kill -0 "$legacy_pid" 2>/dev/null; then
+      remaining=1
+      break
+    fi
+  done
+  [[ "$remaining" == "1" ]] || break
+  sleep 0.5
+done
+for legacy_pid in "${LEGACY_RUNTIME_PIDS[@]}"; do
+  if kill -0 "$legacy_pid" 2>/dev/null; then
+    kill -KILL "$legacy_pid" 2>/dev/null || true
+  fi
+done
+# Catch a runtime that a process supervisor launched during the stop boundary.
+# The executable has already been renamed, so no further restart can succeed.
+sleep 0.2
+for proc in /proc/[0-9]*; do
+  [[ -r "$proc/cmdline" ]] || continue
+  cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* ]] || continue
+  cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
+  exe_path="$(printf '%s' "$cmdline" | grep -oE "/[^ ]*/${CLOUD_EXECUTABLE}" | head -n 1 || true)"
+  if [[ "$cwd" == "$TARGET_DIR" || ( -n "$exe_path" && "$(dirname "$exe_path")" == "$TARGET_DIR" ) ]]; then
+    kill -KILL "${proc##*/}" 2>/dev/null || true
+  fi
+done
+sleep 0.2
+
 mkdir -p "$TARGET_DIR/shared"
 for persistent_file in \
   config.toml \
   okx_futures.toml \
   cloud_web_auth.json \
   config.toml.cloud-automation-guard.json; do
-  if [[ -f "$TARGET_DIR/$persistent_file" && ! -f "$TARGET_DIR/shared/$persistent_file" ]]; then
+  if [[ -f "$TARGET_DIR/$persistent_file" ]]; then
     cp -p "$TARGET_DIR/$persistent_file" "$TARGET_DIR/shared/$persistent_file"
     chmod 0600 "$TARGET_DIR/shared/$persistent_file"
   fi
 done
-# The new runtime resolves relative database paths beside shared/config.toml.
-# Symlinks preserve the exact live database files without copying SQLite while
-# the legacy process is running. They can be replaced with real files during a
-# later planned maintenance window if desired.
-for database_file in "$TARGET_DIR"/*.sqlite3 "$TARGET_DIR"/*.sqlite3-shm "$TARGET_DIR"/*.sqlite3-wal; do
-  [[ -e "$database_file" ]] || continue
-  database_name="$(basename "$database_file")"
-  [[ -e "$TARGET_DIR/shared/$database_name" ]] || ln -s "../$database_name" "$TARGET_DIR/shared/$database_name"
-done
+
+LEGACY_PERSISTENCE_SOURCES=()
+stage_legacy_persistence_path() {
+  local source="$1" relative destination linked_target=""
+  relative="${source#"$TARGET_DIR/"}"
+  destination="$TARGET_DIR/shared/$relative"
+  mkdir -p "$(dirname "$destination")"
+  if [[ -L "$destination" ]]; then
+    linked_target="$(readlink -f "$destination" 2>/dev/null || true)"
+    [[ "$linked_target" == "$source" ]] \
+      || die "Existing migration link does not point to the legacy data: $destination"
+    rm -f "$destination"
+  elif [[ -e "$destination" ]]; then
+    rm -rf -- "$destination"
+  fi
+  cp -a "$source" "$destination"
+  LEGACY_PERSISTENCE_SOURCES+=("$source")
+}
+
+remove_legacy_persistence_sources() {
+  local source
+  for source in "${LEGACY_PERSISTENCE_SOURCES[@]}"; do
+    rm -rf -- "$source"
+  done
+}
+
+# The old runtime is stopped above, so persistent SQLite state is staged in
+# shared as real files. The source remains intact until the managed release is
+# healthy, then is removed. Preserve relative subdirectories for custom paths
+# and include every WAL/SHM sidecar plus submitted-order recovery data.
+while IFS= read -r -d '' database_file; do
+  stage_legacy_persistence_path "$database_file"
+done < <(
+  find "$TARGET_DIR" \
+    \( -path "$TARGET_DIR/shared" -o -path "$TARGET_DIR/releases" -o -path "$TARGET_DIR/staging" \) -prune -o \
+    -type f \( -name '*.sqlite3' -o -name '*.sqlite3-shm' -o -name '*.sqlite3-wal' \) -print0
+)
+while IFS= read -r -d '' recovery_dir; do
+  stage_legacy_persistence_path "$recovery_dir"
+done < <(
+  find "$TARGET_DIR" \
+    \( -path "$TARGET_DIR/shared" -o -path "$TARGET_DIR/releases" -o -path "$TARGET_DIR/staging" \) -prune -o \
+    -type d -name '*.sqlite3.submitted-order-recovery' -print0
+)
 
 # Wallet-vault delivery state is outside the installation directory and its
 # file name is keyed by the absolute config path. Bridge the old flat config
@@ -272,8 +364,11 @@ migrate_wallet_vault_runtime_state() {
       old_path="$legacy_state_dir/.device-${old_identity}.dat.key"
       new_path="$managed_state_dir/.device-${new_identity}.dat.key"
     fi
+    if [[ -L "$new_path" && "$(readlink -f "$new_path" 2>/dev/null || true)" == "$old_path" ]]; then
+      rm -f "$new_path"
+    fi
     if [[ -e "$old_path" && ! -e "$new_path" ]]; then
-      ln -s "$old_path" "$new_path"
+      cp -p "$old_path" "$new_path"
     fi
   done
 }
@@ -311,8 +406,8 @@ chmod 0755 "$INSTALLER_PATH.new"
 mv -f "$INSTALLER_PATH.new" "$INSTALLER_PATH"
 
 export POLYNEXUS_INSTALL_ROOT="$TARGET_DIR"
-if [[ -n "$ACTIVE_PID" ]]; then
-  export POLYNEXUS_RUNTIME_SUPERVISOR_PID="$ACTIVE_PID"
-fi
 bash "$INSTALLER_PATH" --install-dir "$TARGET_DIR" --supervisor "$SUPERVISOR_MODE" install
+remove_legacy_persistence_sources
+rm -f "$LEGACY_EXECUTABLE_BACKUP"
+MIGRATION_SUCCEEDED=1
 printf '%s legacy migration completed. Future updates use %s only.\n' "$APP_NAME" "$INSTALLER_PATH"

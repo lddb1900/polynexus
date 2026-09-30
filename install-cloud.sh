@@ -224,7 +224,10 @@ validate_archive() {
 }
 
 verify_packaged_executable() {
-  local release_dir="$1" expected_version="$2" executable="$release_dir/$CLOUD_EXECUTABLE"
+  local release_dir expected_version executable
+  release_dir="$1"
+  expected_version="$2"
+  executable="$release_dir/$CLOUD_EXECUTABLE"
   local manifest="$release_dir/${CLOUD_EXECUTABLE}.integrity.json" expected actual packaged_version
   [[ -f "$executable" ]] || die "Cloud executable is missing from the release archive."
   [[ -f "$manifest" ]] || die "Signed integrity manifest is missing from the release archive."
@@ -239,7 +242,9 @@ verify_packaged_executable() {
 }
 
 release_identity_version() {
-  local release_dir="$1" executable="$release_dir/$CLOUD_EXECUTABLE"
+  local release_dir executable
+  release_dir="$1"
+  executable="$release_dir/$CLOUD_EXECUTABLE"
   local manifest="$release_dir/${CLOUD_EXECUTABLE}.integrity.json" expected actual version recorded_version
   [[ -f "$executable" && -f "$manifest" ]] || return 1
   expected="$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$manifest" | head -n 1 | tr 'A-F' 'a-f')"
@@ -267,13 +272,17 @@ version_is_newer() {
 }
 
 release_guard_is_valid() {
-  local release_dir="$1" guard="$release_dir/bt-cloud-guard.sh"
+  local release_dir guard
+  release_dir="$1"
+  guard="$release_dir/bt-cloud-guard.sh"
   [[ -f "$guard" ]] || return 1
   bash -n "$guard" >/dev/null 2>&1
 }
 
 install_guard_from_release() {
-  local release_dir="$1" source="$release_dir/bt-cloud-guard.sh"
+  local release_dir source
+  release_dir="$1"
+  source="$release_dir/bt-cloud-guard.sh"
   local temporary="$INSTALL_ROOT/bt-cloud-guard.sh.new.$$"
   release_guard_is_valid "$release_dir" || die "Cloud guard is missing or invalid in release: $release_dir"
   cp "$source" "$temporary"
@@ -377,7 +386,9 @@ EOF
 }
 
 persist_installer() {
-  local destination="$INSTALL_ROOT/install-cloud.sh" temporary="${destination}.new.$$"
+  local destination temporary
+  destination="$INSTALL_ROOT/install-cloud.sh"
+  temporary="${destination}.new.$$"
   mkdir -p "$INSTALL_ROOT"
   if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_SOURCE" ]]; then
     if [[ "$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)/$(basename "$SCRIPT_SOURCE")" != "$destination" ]]; then
@@ -396,7 +407,9 @@ persist_installer() {
 }
 
 mark_install_root() {
-  local marker="$INSTALL_ROOT/.cloud-install-root" temporary="${marker}.new.$$"
+  local marker temporary
+  marker="$INSTALL_ROOT/.cloud-install-root"
+  temporary="${marker}.new.$$"
   printf '%s\n' "$BRAND_ID" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$marker"
