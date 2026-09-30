@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Stable installer/updater. The Polymarket public repository receives this file
 # with the five brand constants below rendered for that brand.
@@ -11,6 +12,7 @@ CLOUD_ARCHIVE="${POLYNEXUS_UPDATE_CLOUD_ARCHIVE:-PolyNexusCloud-linux-x64-centos
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"; }
+[[ "$EUID" -eq 0 ]] || die "Run the cloud installer as root, for example with sudo."
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_DIR=""
@@ -329,7 +331,8 @@ start_runtime() {
     done
   fi
   [[ -x "$INSTALL_ROOT/bt-cloud-guard.sh" ]] || die "Cloud guard is missing."
-  nohup "$INSTALL_ROOT/bt-cloud-guard.sh" > "$SHARED_DIR/guard.out.log" 2>&1 &
+  mkdir -p "$SHARED_DIR/logs"
+  nohup "$INSTALL_ROOT/bt-cloud-guard.sh" > "$SHARED_DIR/logs/guard.out.log" 2>&1 &
 }
 
 configure_supervisor() {
@@ -358,6 +361,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
+Group=root
 WorkingDirectory=$INSTALL_ROOT
 ExecStart=$INSTALL_ROOT/bt-cloud-guard.sh
 Restart=always
@@ -388,7 +393,13 @@ persist_installer() {
     chmod 0755 "$temporary"
     mv -f "$temporary" "$destination"
   fi
-  printf '%s\n' "$BRAND_ID" > "$INSTALL_ROOT/.cloud-install-root"
+}
+
+mark_install_root() {
+  local marker="$INSTALL_ROOT/.cloud-install-root" temporary="${marker}.new.$$"
+  printf '%s\n' "$BRAND_ID" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$marker"
 }
 
 prune_installation_artifacts() {
@@ -590,6 +601,10 @@ install_or_update() {
   url="$(printf '%s\n' "$resolved" | sed -n '2p')"
   job_id="manual-$(date -u +%Y%m%d%H%M%S)-$$"
   apply_release --job-id "$job_id" --state-file "$DEFAULT_STATE_FILE" --version "$version" --asset-url "$url" --asset-name "$CLOUD_ARCHIVE"
+  # A directory becomes a managed installation only after the downloaded
+  # release has passed readiness checks.  Until then a one-time legacy
+  # migration can be retried with the same command and source directory.
+  mark_install_root
   printf '%s %s is installed in %s\n' "$APP_NAME" "$version" "$INSTALL_ROOT"
 }
 

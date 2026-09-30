@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # One-time legacy flat-layout migration. This script is intentionally separate
 # from install-cloud.sh; normal installation and future updates never scan the
@@ -8,8 +9,6 @@ BRAND_ID="${POLYNEXUS_UPDATE_BRAND_ID:-polynexus}"
 APP_NAME="${POLYNEXUS_UPDATE_APP_NAME:-PolyNexus}"
 RELEASE_REPO="${POLYNEXUS_UPDATE_RELEASE_REPO:-lddb1900/polynexus}"
 CLOUD_EXECUTABLE="${POLYNEXUS_UPDATE_CLOUD_EXECUTABLE:-PolyNexusCloud}"
-MIGRATION_HOST="${POLYNEXUS_HOST:-127.0.0.1}"
-MIGRATION_PORT="${POLYNEXUS_PORT:-8765}"
 MIGRATION_ENV_FILE="${POLYNEXUS_ENV_FILE:-/etc/${BRAND_ID}/cloud.env}"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -86,12 +85,38 @@ persist_migration_master_key() {
   chmod 600 "$MIGRATION_ENV_FILE" 2>/dev/null || true
 }
 
-read_process_master_key() {
-  local pid="$1"
+read_process_environment_value() {
+  local pid="$1" variable_name="$2"
   [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/environ" ]] || return 0
   tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-    | sed -n 's/^POLYNEXUS_MASTER_KEY=//p' \
-    | tail -n 1
+    | awk -v prefix="${variable_name}=" \
+        'index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) } END { printf "%s", value }'
+}
+
+read_process_master_key() {
+  read_process_environment_value "$1" POLYNEXUS_MASTER_KEY
+}
+
+read_persisted_runtime_value() {
+  local variable_name="$1"
+  [[ -f "$MIGRATION_ENV_FILE" ]] || return 0
+  (
+    unset XDG_STATE_HOME
+    set -a
+    # shellcheck disable=SC1090
+    source "$MIGRATION_ENV_FILE"
+    set +a
+    case "$variable_name" in
+      XDG_STATE_HOME) printf '%s' "${XDG_STATE_HOME:-}" ;;
+      *) return 1 ;;
+    esac
+  ) 2>/dev/null || true
+}
+
+read_process_uid() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/status" ]] || return 0
+  awk '/^Uid:/ { printf "%s", $2; exit }' "/proc/$pid/status" 2>/dev/null || true
 }
 
 verify_secret_storage_continuity() {
@@ -119,19 +144,6 @@ verify_secret_storage_continuity() {
     persist_migration_master_key "$effective_key" \
       || die "Unable to persist the existing POLYNEXUS_MASTER_KEY to $MIGRATION_ENV_FILE."
   fi
-}
-
-manifest_version() {
-  local manifest="$1"
-  [[ -f "$manifest" ]] || return 0
-  sed -n 's/.*"app_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1
-}
-
-running_health_version() {
-  local body
-  body="$(curl -sS --max-time 2 "http://${MIGRATION_HOST}:${MIGRATION_PORT}/api/health" 2>/dev/null || true)"
-  printf '%s' "$body" | grep -Eq '"brand_id"[[:space:]]*:[[:space:]]*"'"$BRAND_ID"'"' || return 0
-  printf '%s' "$body" | sed -n 's/.*"app_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 declare -A CANDIDATES=()
@@ -189,7 +201,8 @@ for proc in /proc/[0-9]*; do
   cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
   [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* && "$cmdline" != *"--worker"* ]] || continue
   cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
-  if [[ "$cwd" == "$TARGET_DIR" ]]; then
+  exe_path="$(printf '%s' "$cmdline" | grep -oE "/[^ ]*/${CLOUD_EXECUTABLE}" | head -n 1 || true)"
+  if [[ "$cwd" == "$TARGET_DIR" || ( -n "$exe_path" && "$(dirname "$exe_path")" == "$TARGET_DIR" ) ]]; then
     ACTIVE_PID="${proc##*/}"
     break
   fi
@@ -200,15 +213,15 @@ done
 # the key actually inherited by the running legacy supervisor before writing
 # any new-layout files.
 RUNNING_MASTER_KEY="$(read_process_master_key "$ACTIVE_PID")"
+LEGACY_RUNTIME_UID="$(read_process_uid "$ACTIVE_PID")"
+if [[ -n "$LEGACY_RUNTIME_UID" && "$LEGACY_RUNTIME_UID" != "0" ]]; then
+  LEGACY_RUNTIME_USER="$(getent passwd "$LEGACY_RUNTIME_UID" 2>/dev/null | cut -d: -f1 || true)"
+  printf '%s\n' \
+    "Warning: the legacy runtime is owned by ${LEGACY_RUNTIME_USER:-UID $LEGACY_RUNTIME_UID}. The managed cloud runtime runs as root, so its user-scoped activation must be completed again after migration." \
+    >&2
+fi
 verify_secret_storage_continuity "$TARGET_DIR/config.toml" "$RUNNING_MASTER_KEY"
 verify_secret_storage_continuity "$TARGET_DIR/okx_futures.toml" "$RUNNING_MASTER_KEY"
-
-LEGACY_VERSION="$(manifest_version "$TARGET_DIR/${CLOUD_EXECUTABLE}.integrity.json")"
-if [[ -z "$LEGACY_VERSION" && -n "$ACTIVE_PID" ]]; then
-  LEGACY_VERSION="$(running_health_version)"
-fi
-[[ "$LEGACY_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] \
-  || die "Unable to establish the legacy application version required for verified rollback. Start the legacy service and retry."
 
 mkdir -p "$TARGET_DIR/shared"
 for persistent_file in \
@@ -218,6 +231,7 @@ for persistent_file in \
   config.toml.cloud-automation-guard.json; do
   if [[ -f "$TARGET_DIR/$persistent_file" && ! -f "$TARGET_DIR/shared/$persistent_file" ]]; then
     cp -p "$TARGET_DIR/$persistent_file" "$TARGET_DIR/shared/$persistent_file"
+    chmod 0600 "$TARGET_DIR/shared/$persistent_file"
   fi
 done
 # The new runtime resolves relative database paths beside shared/config.toml.
@@ -230,18 +244,59 @@ for database_file in "$TARGET_DIR"/*.sqlite3 "$TARGET_DIR"/*.sqlite3-shm "$TARGE
   [[ -e "$TARGET_DIR/shared/$database_name" ]] || ln -s "../$database_name" "$TARGET_DIR/shared/$database_name"
 done
 
-# Register the verified flat-layout executable as the initial release target.
-# The normal installer can then use its existing version-checked rollback path
-# if the first migrated release does not become healthy. No legacy discovery is
-# added to normal installation or update commands.
-LEGACY_RELEASE_DIR="$TARGET_DIR/releases/legacy-$(date -u +%Y%m%d%H%M%S)"
-mkdir -p "$LEGACY_RELEASE_DIR"
-cp -p "$TARGET_DIR/$CLOUD_EXECUTABLE" "$LEGACY_RELEASE_DIR/$CLOUD_EXECUTABLE"
-cp -p "$TARGET_DIR/${CLOUD_EXECUTABLE}.integrity.json" "$LEGACY_RELEASE_DIR/${CLOUD_EXECUTABLE}.integrity.json"
-cp -p "$TARGET_DIR/bt-cloud-guard.sh" "$LEGACY_RELEASE_DIR/bt-cloud-guard.sh"
-printf '%s\n' "$LEGACY_VERSION" > "$LEGACY_RELEASE_DIR/.app-version"
-ln -sfn "$LEGACY_RELEASE_DIR" "$TARGET_DIR/current.migration"
-mv -Tf "$TARGET_DIR/current.migration" "$TARGET_DIR/current"
+# Wallet-vault delivery state is outside the installation directory and its
+# file name is keyed by the absolute config path. Bridge the old flat config
+# identity to shared/config.toml once so an encrypted pending envelope and the
+# device signing identity survive this one-time migration. Normal installs and
+# updates never need this compatibility step.
+migrate_wallet_vault_runtime_state() {
+  local legacy_state_home="$1" managed_state_home="$2"
+  local legacy_state_dir managed_state_dir
+  local old_config new_config old_identity new_identity old_path new_path suffix
+  legacy_state_home="$(normalize_dir "$legacy_state_home")"
+  managed_state_home="$(normalize_dir "$managed_state_home")"
+  legacy_state_dir="$legacy_state_home/${BRAND_ID}/runtime-state"
+  managed_state_dir="$managed_state_home/${BRAND_ID}/runtime-state"
+  old_config="$(normalize_dir "$TARGET_DIR/config.toml")"
+  new_config="$(normalize_dir "$TARGET_DIR/shared/config.toml")"
+  old_identity="$(printf '%s' "$old_config" | sha256sum | awk '{print $1}')"
+  new_identity="$(printf '%s' "$new_config" | sha256sum | awk '{print $1}')"
+  [[ "$old_identity" != "$new_identity" && -d "$legacy_state_dir" ]] || return 0
+  mkdir -p "$managed_state_dir"
+  chmod 0700 "$managed_state_dir" 2>/dev/null || true
+  for suffix in pending device; do
+    if [[ "$suffix" == "pending" ]]; then
+      old_path="$legacy_state_dir/.pending-${old_identity}.dat"
+      new_path="$managed_state_dir/.pending-${new_identity}.dat"
+    else
+      old_path="$legacy_state_dir/.device-${old_identity}.dat.key"
+      new_path="$managed_state_dir/.device-${new_identity}.dat.key"
+    fi
+    if [[ -e "$old_path" && ! -e "$new_path" ]]; then
+      ln -s "$old_path" "$new_path"
+    fi
+  done
+}
+
+RUNNING_XDG_STATE_HOME="$(read_process_environment_value "$ACTIVE_PID" XDG_STATE_HOME)"
+RUNNING_HOME="$(read_process_environment_value "$ACTIVE_PID" HOME)"
+PERSISTED_XDG_STATE_HOME="$(read_persisted_runtime_value XDG_STATE_HOME)"
+MANAGED_STATE_HOME="${PERSISTED_XDG_STATE_HOME:-/root/.local/state}"
+if [[ -n "$RUNNING_XDG_STATE_HOME" ]]; then
+  LEGACY_STATE_HOME="$RUNNING_XDG_STATE_HOME"
+elif [[ -n "$RUNNING_HOME" ]]; then
+  LEGACY_STATE_HOME="$RUNNING_HOME/.local/state"
+else
+  LEGACY_STATE_HOME="$MANAGED_STATE_HOME"
+fi
+migrate_wallet_vault_runtime_state "$LEGACY_STATE_HOME" "$MANAGED_STATE_HOME"
+
+# Legacy builds did not consistently publish a machine-readable version. They
+# are therefore never registered as a rollback release. The old executable is
+# used only to verify that the selected directory is a genuine legacy install;
+# persistent files are migrated above and the standard installer now downloads
+# the latest verified GitHub Release as the first managed software version.
+rm -f "$TARGET_DIR/current.migration"
 
 INSTALLER_PATH="$TARGET_DIR/install-cloud.sh"
 if [[ -n "$INSTALLER_SOURCE" ]]; then
