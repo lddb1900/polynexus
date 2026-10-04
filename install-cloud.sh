@@ -598,8 +598,19 @@ resolve_latest_release() {
   response="$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 \
     -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
     "https://api.github.com/repos/${RELEASE_REPO}/releases/latest")"
-  tag="$(printf '%s\n' "$response" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-  url="$(printf '%s\n' "$response" | sed -n 's/^[[:space:]]*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' | grep "/${CLOUD_ARCHIVE}$" | head -n 1)"
+  # GitHub may return either pretty-printed or compact single-line JSON.
+  # Extract individual key/value tokens instead of assuming one field per line.
+  tag="$(printf '%s\n' "$response" \
+    | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | head -n 1 \
+    | sed 's/^[^:]*:[[:space:]]*"\([^"]*\)"$/\1/' \
+    || true)"
+  url="$(printf '%s\n' "$response" \
+    | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed 's/^[^:]*:[[:space:]]*"\([^"]*\)"$/\1/' \
+    | grep -F "/${CLOUD_ARCHIVE}" \
+    | head -n 1 \
+    || true)"
   [[ -n "$tag" && -n "$url" ]] || die "Latest GitHub release or fixed cloud asset was not found."
   tag="${tag#v}"; tag="${tag#V}"
   [[ "$tag" =~ ^[0-9]+(\.[0-9]+)+$ ]] || die "Latest GitHub release tag is not a supported version."
