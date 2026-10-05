@@ -599,7 +599,8 @@ apply_release() {
   mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$STAGING_DIR" \
     || fail_apply_preflight "$state_file" "$job_id" "$version" "Unable to prepare the cloud installation directories."
   exec 9>"$INSTALL_ROOT/.update-operation.lock"
-  flock -n 9 || die "Another installation or update is already running."
+  flock -n 9 \
+    || fail_apply_preflight "$state_file" "$job_id" "$version" "Another installation or update is already running."
   # Only the process that owns the update lock may remove the maintenance
   # marker or publish terminal update state. A competing invocation exits
   # above without disturbing the active maintainer.
