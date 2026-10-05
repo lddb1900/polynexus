@@ -93,6 +93,21 @@ read_process_environment_value() {
         'index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) } END { printf "%s", value }'
 }
 
+read_process_argument() {
+  local pid="$1" wanted="$2" argument="" return_next=0
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 0
+  while IFS= read -r -d '' argument; do
+    if [[ "$return_next" == "1" ]]; then
+      printf '%s' "$argument"
+      return 0
+    fi
+    case "$argument" in
+      "$wanted") return_next=1 ;;
+      "$wanted="*) printf '%s' "${argument#*=}"; return 0 ;;
+    esac
+  done < "/proc/$pid/cmdline"
+}
+
 read_process_master_key() {
   read_process_environment_value "$1" POLYNEXUS_MASTER_KEY
 }
@@ -197,13 +212,19 @@ printf 'Migrating the verified legacy installation in place: %s\n' "$TARGET_DIR"
 
 ACTIVE_PID=""
 LEGACY_RUNTIME_PIDS=()
+path_is_within_target() {
+  case "$1" in
+    "$TARGET_DIR"|"$TARGET_DIR"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 for proc in /proc/[0-9]*; do
   [[ -r "$proc/cmdline" ]] || continue
   cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
   [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* ]] || continue
   cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
   exe_path="$(printf '%s' "$cmdline" | grep -oE "/[^ ]*/${CLOUD_EXECUTABLE}" | head -n 1 || true)"
-  if [[ "$cwd" == "$TARGET_DIR" || ( -n "$exe_path" && "$(dirname "$exe_path")" == "$TARGET_DIR" ) ]]; then
+  if path_is_within_target "$cwd" || { [[ -n "$exe_path" ]] && path_is_within_target "$exe_path"; }; then
     LEGACY_RUNTIME_PIDS+=("${proc##*/}")
     if [[ -z "$ACTIVE_PID" || "$cmdline" != *"--worker"* ]]; then
       ACTIVE_PID="${proc##*/}"
@@ -216,9 +237,16 @@ done
 # the key actually inherited by the running legacy supervisor before writing
 # any new-layout files.
 RUNNING_MASTER_KEY="$(read_process_master_key "$ACTIVE_PID")"
+LEGACY_HOST="$(read_process_argument "$ACTIVE_PID" --host)"
+LEGACY_HOST="${LEGACY_HOST:-$(read_process_environment_value "$ACTIVE_PID" POLYNEXUS_HOST)}"
+LEGACY_PORT="$(read_process_argument "$ACTIVE_PID" --port)"
+LEGACY_PORT="${LEGACY_PORT:-$(read_process_environment_value "$ACTIVE_PID" POLYNEXUS_PORT)}"
 LEGACY_RUNTIME_UID="$(read_process_uid "$ACTIVE_PID")"
+LEGACY_RUNTIME_HOME="/root"
 if [[ -n "$LEGACY_RUNTIME_UID" && "$LEGACY_RUNTIME_UID" != "0" ]]; then
   LEGACY_RUNTIME_USER="$(getent passwd "$LEGACY_RUNTIME_UID" 2>/dev/null | cut -d: -f1 || true)"
+  LEGACY_RUNTIME_HOME="$(getent passwd "$LEGACY_RUNTIME_UID" 2>/dev/null | cut -d: -f6 || true)"
+  LEGACY_RUNTIME_HOME="${LEGACY_RUNTIME_HOME:-/root}"
   printf '%s\n' \
     "Warning: the legacy runtime is owned by ${LEGACY_RUNTIME_USER:-UID $LEGACY_RUNTIME_UID}. The managed cloud runtime runs as root, so its user-scoped activation must be completed again after migration." \
     >&2
@@ -228,6 +256,8 @@ verify_secret_storage_continuity "$TARGET_DIR/okx_futures.toml" "$RUNNING_MASTER
 
 LEGACY_EXECUTABLE="$TARGET_DIR/$CLOUD_EXECUTABLE"
 LEGACY_EXECUTABLE_BACKUP="$TARGET_DIR/.${CLOUD_EXECUTABLE}.migration-backup"
+LEGACY_RUNTIME_WAS_RUNNING=0
+[[ ${#LEGACY_RUNTIME_PIDS[@]} -eq 0 ]] || LEGACY_RUNTIME_WAS_RUNNING=1
 MIGRATION_SUCCEEDED=0
 restore_legacy_runtime_on_failure() {
   local exit_code=$?
@@ -235,6 +265,19 @@ restore_legacy_runtime_on_failure() {
     if [[ -f "$LEGACY_EXECUTABLE_BACKUP" && ! -e "$LEGACY_EXECUTABLE" ]]; then
       mv -f "$LEGACY_EXECUTABLE_BACKUP" "$LEGACY_EXECUTABLE" || true
       chmod 0755 "$LEGACY_EXECUTABLE" 2>/dev/null || true
+    fi
+    if [[ "$LEGACY_RUNTIME_WAS_RUNNING" == "1" && -x "$LEGACY_EXECUTABLE" ]]; then
+      case "$SUPERVISOR_MODE" in
+        systemd)
+          systemctl restart "${POLYNEXUS_CLOUD_SERVICE:-${BRAND_ID}-cloud.service}" >/dev/null 2>&1 || true
+          ;;
+        standalone)
+          nohup "$TARGET_DIR/bt-cloud-guard.sh" >/dev/null 2>&1 &
+          ;;
+        baota)
+          # BaoTa owns restart policy and will observe the restored executable.
+          ;;
+      esac
     fi
   fi
   exit "$exit_code"
@@ -274,7 +317,7 @@ for proc in /proc/[0-9]*; do
   [[ "$cmdline" == *"$CLOUD_EXECUTABLE"* ]] || continue
   cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
   exe_path="$(printf '%s' "$cmdline" | grep -oE "/[^ ]*/${CLOUD_EXECUTABLE}" | head -n 1 || true)"
-  if [[ "$cwd" == "$TARGET_DIR" || ( -n "$exe_path" && "$(dirname "$exe_path")" == "$TARGET_DIR" ) ]]; then
+  if path_is_within_target "$cwd" || { [[ -n "$exe_path" ]] && path_is_within_target "$exe_path"; }; then
     kill -KILL "${proc##*/}" 2>/dev/null || true
   fi
 done
@@ -293,10 +336,16 @@ for persistent_file in \
 done
 
 LEGACY_PERSISTENCE_SOURCES=()
+LEGACY_EPHEMERAL_SOURCES=()
+declare -A STAGED_PERSISTENCE_PATHS=()
 stage_legacy_persistence_path() {
-  local source="$1" relative destination linked_target=""
-  relative="${source#"$TARGET_DIR/"}"
-  destination="$TARGET_DIR/shared/$relative"
+  local source destination linked_target="" stage_key
+  source="$(normalize_dir "$1")"
+  destination="$(normalize_dir "$2")"
+  [[ "$source" != "$destination" && -e "$source" ]] || return 0
+  stage_key="$source|$destination"
+  [[ -z "${STAGED_PERSISTENCE_PATHS[$stage_key]:-}" ]] || return 0
+  STAGED_PERSISTENCE_PATHS["$stage_key"]=1
   mkdir -p "$(dirname "$destination")"
   if [[ -L "$destination" ]]; then
     linked_target="$(readlink -f "$destination" 2>/dev/null || true)"
@@ -311,30 +360,203 @@ stage_legacy_persistence_path() {
 }
 
 remove_legacy_persistence_sources() {
-  local source
+  local source cleanup_failed=0
   for source in "${LEGACY_PERSISTENCE_SOURCES[@]}"; do
-    rm -rf -- "$source"
+    rm -rf -- "$source" || cleanup_failed=1
   done
+  for source in "${LEGACY_EPHEMERAL_SOURCES[@]}"; do
+    rm -f -- "$source" || cleanup_failed=1
+  done
+  return "$cleanup_failed"
 }
 
-# The old runtime is stopped above, so persistent SQLite state is staged in
-# shared as real files. The source remains intact until the managed release is
-# healthy, then is removed. Preserve relative subdirectories for custom paths
-# and include every WAL/SHM sidecar plus submitted-order recovery data.
-while IFS= read -r -d '' database_file; do
-  stage_legacy_persistence_path "$database_file"
-done < <(
-  find "$TARGET_DIR" \
-    \( -path "$TARGET_DIR/shared" -o -path "$TARGET_DIR/releases" -o -path "$TARGET_DIR/staging" \) -prune -o \
-    -type f \( -name '*.sqlite3' -o -name '*.sqlite3-shm' -o -name '*.sqlite3-wal' \) -print0
-)
-while IFS= read -r -d '' recovery_dir; do
-  stage_legacy_persistence_path "$recovery_dir"
-done < <(
-  find "$TARGET_DIR" \
-    \( -path "$TARGET_DIR/shared" -o -path "$TARGET_DIR/releases" -o -path "$TARGET_DIR/staging" \) -prune -o \
-    -type d -name '*.sqlite3.submitted-order-recovery' -print0
-)
+remove_legacy_flat_layout_files() {
+  local legacy_file stale_lock cleanup_failed=0
+  # These files have authoritative replacements in shared or in the active
+  # managed release. Remove them only after the new release has passed its
+  # readiness check so the completed migration leaves one unambiguous copy.
+  for legacy_file in \
+    config.toml \
+    okx_futures.toml \
+    cloud_web_auth.json \
+    config.toml.cloud-automation-guard.json \
+    "${CLOUD_EXECUTABLE}.integrity.json"; do
+    rm -f -- "$TARGET_DIR/$legacy_file" || cleanup_failed=1
+  done
+
+  # These log locks belong only to the flat-layout logger. Database locks are
+  # registered from the actual migrated database paths below, so an absolute
+  # database path that remains active is never deleted accidentally.
+  for stale_lock in "$TARGET_DIR"/.cloud-*.log.lock; do
+    [[ -e "$stale_lock" ]] || continue
+    rm -f -- "$stale_lock" || cleanup_failed=1
+  done
+  return "$cleanup_failed"
+}
+
+read_toml_path_value() {
+  local config_path="$1" section="$2" key="$3" raw=""
+  [[ -f "$config_path" ]] || return 0
+  raw="$(awk -v wanted_section="$section" -v wanted_key="$key" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      current = $0
+      sub(/^[[:space:]]*\[/, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      next
+    }
+    current == wanted_section && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" {
+      value = $0
+      sub("^[[:space:]]*" wanted_key "[[:space:]]*=[[:space:]]*", "", value)
+      print value
+      exit
+    }
+  ' "$config_path")"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  case "$raw" in
+    \"*) raw="${raw#\"}"; raw="${raw%%\"*}" ;;
+    \'*) raw="${raw#\'}"; raw="${raw%%\'*}" ;;
+    *) raw="${raw%%#*}"; raw="${raw%"${raw##*[![:space:]]}"}" ;;
+  esac
+  printf '%s' "$raw"
+}
+
+resolve_configured_path() {
+  local value="$1" config_path="$2" user_home="$3"
+  case "$value" in
+    /*) normalize_dir "$value" ;;
+    '~') normalize_dir "$user_home" ;;
+    '~/'*) normalize_dir "$user_home/${value#~/}" ;;
+    *) normalize_dir "$(dirname "$config_path")/$value" ;;
+  esac
+}
+
+rewrite_toml_path_value() {
+  local config_path="$1" section="$2" key="$3" value="$4" temporary
+  [[ -f "$config_path" ]] || return 0
+  temporary="${config_path}.migration-new.$$"
+  awk -v wanted_section="$section" -v wanted_key="$key" -v replacement="$value" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      current = $0
+      sub(/^[[:space:]]*\[/, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      print $0
+      if (current == wanted_section) {
+        printf "%s = \"%s\"\n", wanted_key, replacement
+      }
+      next
+    }
+    current == wanted_section && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" { next }
+    { print }
+  ' "$config_path" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$config_path"
+}
+
+derived_sqlite_path() {
+  local source="$1" marker="$2" directory name stem
+  directory="$(dirname "$source")"
+  name="$(basename "$source")"
+  stem="${name%.*}"
+  [[ "$stem" != "$name" ]] || stem="$name"
+  normalize_dir "$directory/${stem}.${marker}.sqlite3"
+}
+
+derived_peer_path() {
+  local source="$1" marker="$2" directory name stem suffix=""
+  directory="$(dirname "$source")"
+  name="$(basename "$source")"
+  stem="${name%.*}"
+  if [[ "$stem" != "$name" ]]; then
+    suffix=".${name##*.}"
+  else
+    stem="$name"
+  fi
+  normalize_dir "$directory/${stem}.${marker}${suffix}"
+}
+
+stage_database_family() {
+  local source="$1" destination="$2" suffix
+  for suffix in '' -shm -wal; do
+    stage_legacy_persistence_path "$source$suffix" "$destination$suffix"
+  done
+  stage_legacy_persistence_path "${source}.submitted-order-recovery" "${destination}.submitted-order-recovery"
+  if [[ "$source" != "$destination" && -e "${source}.runtime.lock" ]]; then
+    LEGACY_EPHEMERAL_SOURCES+=("${source}.runtime.lock")
+  fi
+}
+
+stage_configured_databases() {
+  local old_config="$TARGET_DIR/config.toml" new_config="$TARGET_DIR/shared/config.toml"
+  local state_value l2_value old_state new_state old_l2 new_l2 old_twap new_twap
+  local old_okx new_okx okx_value old_history new_history old_staging new_staging
+
+  state_value="$(read_toml_path_value "$old_config" bot state_db_path)"
+  state_value="${state_value:-bot_state.sqlite3}"
+  old_state="$(resolve_configured_path "$state_value" "$old_config" "$LEGACY_RUNTIME_HOME")"
+  new_state="$TARGET_DIR/shared/bot_state.sqlite3"
+  stage_database_family "$old_state" "$new_state"
+
+  l2_value="$(read_toml_path_value "$old_config" bot l2_shadow_db_path)"
+  if [[ -n "$l2_value" ]]; then
+    old_l2="$(resolve_configured_path "$l2_value" "$old_config" "$LEGACY_RUNTIME_HOME")"
+  else
+    old_l2="$(derived_sqlite_path "$old_state" l2-shadow)"
+  fi
+  new_l2="$TARGET_DIR/shared/bot_state.l2-shadow.sqlite3"
+  stage_database_family "$old_l2" "$new_l2"
+  old_history="$(derived_peer_path "$old_l2" history)"
+  new_history="$(derived_peer_path "$new_l2" history)"
+  stage_database_family "$old_history" "$new_history"
+  old_staging="$(derived_peer_path "$old_l2" staging)"
+  new_staging="$(derived_peer_path "$new_l2" staging)"
+  stage_database_family "$old_staging" "$new_staging"
+
+  old_twap="$(derived_sqlite_path "$old_state" twap60-shadow)"
+  new_twap="$TARGET_DIR/shared/bot_state.twap60-shadow.sqlite3"
+  stage_database_family "$old_twap" "$new_twap"
+
+  rewrite_toml_path_value "$new_config" bot state_db_path "bot_state.sqlite3"
+  rewrite_toml_path_value "$new_config" bot l2_shadow_db_path ""
+
+  if [[ -f "$TARGET_DIR/okx_futures.toml" ]]; then
+    okx_value="$(read_toml_path_value "$TARGET_DIR/okx_futures.toml" okx state_db_path)"
+    okx_value="${okx_value:-bot_state.okx-futures.sqlite3}"
+    old_okx="$(resolve_configured_path "$okx_value" "$TARGET_DIR/okx_futures.toml" "$LEGACY_RUNTIME_HOME")"
+    new_okx="$TARGET_DIR/shared/bot_state.okx-futures.sqlite3"
+    stage_database_family "$old_okx" "$new_okx"
+    rewrite_toml_path_value "$TARGET_DIR/shared/okx_futures.toml" okx state_db_path "bot_state.okx-futures.sqlite3"
+  fi
+}
+
+stage_legacy_logs() {
+  local legacy_log_dir source
+  mkdir -p "$TARGET_DIR/shared/logs"
+  # Older packages used both log/ and logs/. Merge their retained history into
+  # the single managed shared/logs directory while the legacy runtime is down.
+  for legacy_log_dir in "$TARGET_DIR/log" "$TARGET_DIR/logs"; do
+    [[ -d "$legacy_log_dir" ]] || continue
+    cp -a "$legacy_log_dir/." "$TARGET_DIR/shared/logs/"
+    LEGACY_PERSISTENCE_SOURCES+=("$legacy_log_dir")
+  done
+  shopt -s nullglob
+  for source in \
+    "$TARGET_DIR"/cloud-debug*.log \
+    "$TARGET_DIR"/cloud-fault*.log \
+    "$TARGET_DIR"/cloud-startup*.log \
+    "$TARGET_DIR"/guard.out.log; do
+    [[ -f "$source" ]] || continue
+    stage_legacy_persistence_path "$source" "$TARGET_DIR/shared/logs/$(basename "$source")"
+  done
+  shopt -u nullglob
+}
+
+# The old runtime is stopped above, so configured databases are copied as real
+# files under shared. The copied configs are rewritten to the standard relative
+# names, so legacy relative, absolute and custom-suffix paths all converge on
+# the managed layout without symlinks.
+stage_configured_databases
+stage_legacy_logs
 
 # Wallet-vault delivery state is outside the installation directory and its
 # file name is keyed by the absolute config path. Bridge the old flat config
@@ -406,8 +628,18 @@ chmod 0755 "$INSTALLER_PATH.new"
 mv -f "$INSTALLER_PATH.new" "$INSTALLER_PATH"
 
 export POLYNEXUS_INSTALL_ROOT="$TARGET_DIR"
+[[ -z "$LEGACY_HOST" ]] || export POLYNEXUS_HOST="$LEGACY_HOST"
+[[ -z "$LEGACY_PORT" ]] || export POLYNEXUS_PORT="$LEGACY_PORT"
 bash "$INSTALLER_PATH" --install-dir "$TARGET_DIR" --supervisor "$SUPERVISOR_MODE" install
-remove_legacy_persistence_sources
-rm -f "$LEGACY_EXECUTABLE_BACKUP"
+# The standard installer returns only after the managed release is healthy.
+# From this point forward the migration is committed: cleanup must never revive
+# the flat-layout executable beside an already-running managed release.
 MIGRATION_SUCCEEDED=1
+cleanup_warning=0
+remove_legacy_persistence_sources || cleanup_warning=1
+remove_legacy_flat_layout_files || cleanup_warning=1
+rm -f "$LEGACY_EXECUTABLE_BACKUP" || cleanup_warning=1
+if [[ "$cleanup_warning" == "1" ]]; then
+  printf '%s\n' "Warning: migration is active, but some legacy files could not be removed. The managed release remains authoritative." >&2
+fi
 printf '%s legacy migration completed. Future updates use %s only.\n' "$APP_NAME" "$INSTALLER_PATH"

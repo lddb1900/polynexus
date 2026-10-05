@@ -14,11 +14,22 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Required command is missing: $1"; }
 [[ "$EUID" -eq 0 ]] || die "Run the cloud installer as root, for example with sudo."
 
-SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+# BASH_SOURCE has no element when the public installer is streamed into
+# `bash -s`. Treat that as an intentional remote bootstrap; persist_installer
+# will download the stable copy into the selected installation root.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
 if [[ -f "$SCRIPT_SOURCE" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)"
 fi
+
+bootstrap_is_valid() {
+  local candidate="$1"
+  bash -n "$candidate" \
+    && grep -Fq "$RELEASE_REPO" "$candidate" \
+    && grep -Fq "$CLOUD_EXECUTABLE" "$candidate" \
+    && grep -Fq "$CLOUD_ARCHIVE" "$candidate"
+}
 
 # An installed copy is a stable bootstrap kept in the public brand repository.
 # Refresh it before mutating the installation so future maintenance fixes do
@@ -27,6 +38,12 @@ ORIGINAL_ARGS=("$@")
 refresh_installed_bootstrap() {
   [[ "${POLYNEXUS_INSTALLER_REFRESHED:-0}" != "1" ]] || return 0
   [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/.cloud-install-root" ]] || return 0
+  local installed_brand=""
+  installed_brand="$(tr -d '\r\n' < "$SCRIPT_DIR/.cloud-install-root")"
+  # Do not let a wrong-brand bootstrap overwrite this installation.  The
+  # command-specific identity check below will publish the normal failed state
+  # once apply-release has parsed its job metadata.
+  [[ "$installed_brand" == "$BRAND_ID" ]] || return 0
   for argument in "${ORIGINAL_ARGS[@]}"; do
     [[ "$argument" != "status" ]] || return 0
   done
@@ -38,12 +55,10 @@ refresh_installed_bootstrap() {
     printf '%s\n' "Warning: unable to refresh install-cloud.sh; continuing with the installed bootstrap." >&2
     return 0
   fi
-  if ! bash -n "$temporary" \
-    || ! grep -Fq "$RELEASE_REPO" "$temporary" \
-    || ! grep -Fq "$CLOUD_EXECUTABLE" "$temporary" \
-    || ! grep -Fq "$CLOUD_ARCHIVE" "$temporary"; then
+  if ! bootstrap_is_valid "$temporary"; then
     rm -f "$temporary"
-    die "Downloaded cloud bootstrap failed identity or syntax validation."
+    printf '%s\n' "Warning: refreshed install-cloud.sh failed validation; continuing with the installed bootstrap." >&2
+    return 0
   fi
   chmod 0755 "$temporary"
   if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then
@@ -103,8 +118,6 @@ CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
 MAINTENANCE_MARKER="$INSTALL_ROOT/.update-maintenance"
 DEFAULT_STATE_FILE="$SHARED_DIR/update-status.json"
-DEFAULT_HOST="${POLYNEXUS_HOST:-127.0.0.1}"
-DEFAULT_PORT="${POLYNEXUS_PORT:-8765}"
 if [[ -z "$SUPERVISOR_MODE" && -f "$INSTALL_ROOT/.cloud-supervisor" ]]; then
   SUPERVISOR_MODE="$(tr -d '\r\n' < "$INSTALL_ROOT/.cloud-supervisor")"
 fi
@@ -135,6 +148,56 @@ process_identity_token() {
   [[ -n "$boot_id" ]] || return 1
   printf 'linux:%s:%s' "$boot_id" "$start_time"
 }
+
+running_runtime_argument() {
+  local wanted="$1" pid="" recorded_start="" actual_start="" argument="" return_next=0
+  [[ -r "$INSTALL_ROOT/runtime.pid" ]] || return 0
+  read -r pid recorded_start < "$INSTALL_ROOT/runtime.pid" || return 0
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 0
+  actual_start="$(pid_start_time "$pid" 2>/dev/null || true)"
+  [[ -n "$actual_start" && "$actual_start" == "$recorded_start" ]] || return 0
+  while IFS= read -r -d '' argument; do
+    if [[ "$return_next" == "1" ]]; then
+      printf '%s' "$argument"
+      return 0
+    fi
+    [[ "$argument" == "$wanted" ]] && return_next=1
+  done < "/proc/$pid/cmdline"
+}
+
+persisted_runtime_argument() {
+  local wanted="$1" runtime_env="$INSTALL_ROOT/.cloud-runtime.env"
+  [[ -f "$runtime_env" ]] || return 0
+  (
+    unset POLYNEXUS_HOST POLYNEXUS_PORT POLYNEXUS_ENV_FILE POLYNEXUS_CLOUD_SERVICE
+    set -a
+    # This root-owned file is written atomically by configure_supervisor.
+    # shellcheck disable=SC1090
+    source "$runtime_env"
+    set +a
+    case "$wanted" in
+      --host) printf '%s' "${POLYNEXUS_HOST:-}" ;;
+      --port) printf '%s' "${POLYNEXUS_PORT:-}" ;;
+      --env-file) printf '%s' "${POLYNEXUS_ENV_FILE:-}" ;;
+      --service) printf '%s' "${POLYNEXUS_CLOUD_SERVICE:-}" ;;
+    esac
+  ) 2>/dev/null || true
+}
+
+RUNNING_HOST="$(running_runtime_argument --host)"
+RUNNING_PORT="$(running_runtime_argument --port)"
+PERSISTED_HOST="$(persisted_runtime_argument --host)"
+PERSISTED_PORT="$(persisted_runtime_argument --port)"
+PERSISTED_ENV_FILE="$(persisted_runtime_argument --env-file)"
+PERSISTED_CLOUD_SERVICE="$(persisted_runtime_argument --service)"
+DEFAULT_HOST="${POLYNEXUS_HOST:-${RUNNING_HOST:-${PERSISTED_HOST:-127.0.0.1}}}"
+DEFAULT_PORT="${POLYNEXUS_PORT:-${RUNNING_PORT:-${PERSISTED_PORT:-8765}}}"
+DEFAULT_ENV_FILE="${POLYNEXUS_ENV_FILE:-${PERSISTED_ENV_FILE:-/etc/${BRAND_ID}/cloud.env}}"
+DEFAULT_CLOUD_SERVICE="${POLYNEXUS_CLOUD_SERVICE:-${PERSISTED_CLOUD_SERVICE:-${BRAND_ID}-cloud.service}}"
+[[ "$DEFAULT_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "The cloud host contains unsupported characters."
+[[ "$DEFAULT_PORT" =~ ^[0-9]+$ ]] || die "The cloud port must be numeric."
+DEFAULT_PORT_NUMBER=$((10#$DEFAULT_PORT))
+(( DEFAULT_PORT_NUMBER >= 1 && DEFAULT_PORT_NUMBER <= 65535 )) || die "The cloud port must be between 1 and 65535."
 
 begin_maintenance() {
   local token="" temporary="${MAINTENANCE_MARKER}.new.$$"
@@ -193,7 +256,7 @@ current_health_version() {
   version="$(health_version_from_body "$body")"
   status="$(health_status_from_body "$body")"
   case "$status" in
-    ready|degraded|activation_required|cloud_auth_setup_required|cloud_auth_login_required)
+    ready|activation_required|cloud_auth_setup_required|cloud_auth_login_required)
       printf '%s' "$version"
       ;;
   esac
@@ -326,8 +389,8 @@ stop_current_runtime() {
 
 start_runtime() {
   local allow_supervisor_grace="${1:-1}"
-  local service_name="${POLYNEXUS_CLOUD_SERVICE:-${BRAND_ID}-cloud.service}"
-  if [[ "$SUPERVISOR_MODE" == "systemd" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-enabled "$service_name" >/dev/null 2>&1; then
+  local service_name="$DEFAULT_CLOUD_SERVICE"
+  if [[ "$SUPERVISOR_MODE" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl restart "$service_name" >/dev/null 2>&1 || true
     return 0
   fi
@@ -344,8 +407,30 @@ start_runtime() {
   nohup "$INSTALL_ROOT/bt-cloud-guard.sh" > "$SHARED_DIR/logs/guard.out.log" 2>&1 &
 }
 
+deactivate_failed_first_release() {
+  local service_name="$DEFAULT_CLOUD_SERVICE"
+  begin_maintenance
+  if [[ "$SUPERVISOR_MODE" == "systemd" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$service_name" >/dev/null 2>&1 || true
+    systemctl disable "$service_name" >/dev/null 2>&1 || true
+  fi
+  stop_current_runtime
+  rm -f "$CURRENT_LINK"
+  end_maintenance
+}
+
+persist_runtime_settings() {
+  local destination="$INSTALL_ROOT/.cloud-runtime.env" temporary
+  temporary="${destination}.new.$$"
+  printf 'POLYNEXUS_HOST=%q\nPOLYNEXUS_PORT=%q\nPOLYNEXUS_ENV_FILE=%q\nPOLYNEXUS_CLOUD_SERVICE=%q\n' \
+    "$DEFAULT_HOST" "$DEFAULT_PORT" "$DEFAULT_ENV_FILE" "$DEFAULT_CLOUD_SERVICE" \
+    > "$temporary" || return 1
+  chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv -f "$temporary" "$destination" || { rm -f "$temporary"; return 1; }
+}
+
 configure_supervisor() {
-  local service_name="${POLYNEXUS_CLOUD_SERVICE:-${BRAND_ID}-cloud.service}"
+  local service_name="$DEFAULT_CLOUD_SERVICE"
   if [[ "$SUPERVISOR_MODE" == "auto" ]]; then
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
       SUPERVISOR_MODE="systemd"
@@ -353,16 +438,17 @@ configure_supervisor() {
       SUPERVISOR_MODE="standalone"
     fi
   fi
+  persist_runtime_settings || return 1
   if [[ "$SUPERVISOR_MODE" != "systemd" ]]; then
-    printf '%s\n' "$SUPERVISOR_MODE" > "$INSTALL_ROOT/.cloud-supervisor"
+    printf '%s\n' "$SUPERVISOR_MODE" > "$INSTALL_ROOT/.cloud-supervisor" || return 1
     return 0
   fi
   command -v systemctl >/dev/null 2>&1 || die "systemd supervisor was requested but systemctl is unavailable."
   [[ -d /run/systemd/system ]] || die "systemd supervisor was requested but systemd is not running."
   [[ "$INSTALL_ROOT" != *[$'\n\r\t ']* && "$INSTALL_ROOT" != *%* ]] || die "The systemd installation path cannot contain whitespace or percent signs."
-  printf '%s\n' "$SUPERVISOR_MODE" > "$INSTALL_ROOT/.cloud-supervisor"
+  printf '%s\n' "$SUPERVISOR_MODE" > "$INSTALL_ROOT/.cloud-supervisor" || return 1
   local unit_path="/etc/systemd/system/$service_name"
-  cat > "$unit_path" <<EOF
+  if ! cat > "$unit_path" <<EOF
 [Unit]
 Description=$APP_NAME Cloud
 After=network-online.target
@@ -373,6 +459,8 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=$INSTALL_ROOT
+Environment=POLYNEXUS_HOST=$DEFAULT_HOST
+Environment=POLYNEXUS_PORT=$DEFAULT_PORT
 ExecStart=$INSTALL_ROOT/bt-cloud-guard.sh
 Restart=always
 RestartSec=2
@@ -381,8 +469,19 @@ KillMode=control-group
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "$service_name" >/dev/null
+  then
+    return 1
+  fi
+  systemctl daemon-reload || return 1
+}
+
+finalize_supervisor() {
+  local service_name="$DEFAULT_CLOUD_SERVICE"
+  if [[ "$SUPERVISOR_MODE" == "systemd" ]]; then
+    # A fresh unit is made persistent only after the runtime proves healthy.
+    # Existing enabled units remain enabled throughout an ordinary update.
+    systemctl enable "$service_name" >/dev/null
+  fi
 }
 
 persist_installer() {
@@ -401,6 +500,10 @@ persist_installer() {
   else
     curl --fail --location --connect-timeout 10 --max-time 30 -o "$temporary" \
       "https://raw.githubusercontent.com/${RELEASE_REPO}/main/install-cloud.sh"
+    if ! bootstrap_is_valid "$temporary"; then
+      rm -f "$temporary"
+      die "Downloaded cloud bootstrap failed identity or syntax validation."
+    fi
     chmod 0755 "$temporary"
     mv -f "$temporary" "$destination"
   fi
@@ -413,6 +516,34 @@ mark_install_root() {
   printf '%s\n' "$BRAND_ID" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$marker"
+}
+
+validate_install_root_identity() {
+  local marker="$INSTALL_ROOT/.cloud-install-root" installed_brand=""
+  INSTALL_ROOT_IDENTITY_ERROR=""
+  if [[ -f "$marker" ]]; then
+    installed_brand="$(tr -d '\r\n' < "$marker")"
+    if [[ "$installed_brand" != "$BRAND_ID" ]]; then
+      INSTALL_ROOT_IDENTITY_ERROR="Installation brand mismatch: expected $BRAND_ID, found ${installed_brand:-unknown}."
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -x "$INSTALL_ROOT/$CLOUD_EXECUTABLE" && -f "$INSTALL_ROOT/config.toml" ]]; then
+    INSTALL_ROOT_IDENTITY_ERROR="A legacy flat-layout installation exists in $INSTALL_ROOT. Run the separate migrate-cloud.sh helper instead."
+    return 1
+  fi
+}
+
+fail_apply_preflight() {
+  local state_file="$1" job_id="$2" version="$3" message="$4"
+  # The dashboard has already created this job's state file.  Only update an
+  # absent file or the same job; never replace a concurrent maintainer's state.
+  if [[ ! -f "$state_file" ]] \
+    || grep -Eq '"job_id"[[:space:]]*:[[:space:]]*"'"$job_id"'"' "$state_file" 2>/dev/null; then
+    write_status "$state_file" "$job_id" "failed" 100 "$message" "$version" || true
+  fi
+  die "$message"
 }
 
 prune_installation_artifacts() {
@@ -448,6 +579,9 @@ apply_release() {
   [[ "$asset_name" == "$CLOUD_ARCHIVE" ]] || die "Unexpected cloud release asset."
   [[ "$asset_url" == "https://github.com/${RELEASE_REPO}/releases/download/"*"/${CLOUD_ARCHIVE}" ]] || die "Unexpected release download URL."
   [[ -z "$expected_sha" || "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "Invalid release SHA-256 digest."
+  if ! validate_install_root_identity; then
+    fail_apply_preflight "$state_file" "$job_id" "$version" "$INSTALL_ROOT_IDENTITY_ERROR"
+  fi
 
   apply_release_exit() {
     local exit_code=$?
@@ -457,19 +591,27 @@ apply_release() {
     fi
     exit "$exit_code"
   }
-  trap apply_release_exit EXIT
-
-  need curl; need tar; need sha256sum; need flock; need sort
-  mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$STAGING_DIR"
+  local required_command
+  for required_command in curl tar sha256sum flock sort; do
+    command -v "$required_command" >/dev/null 2>&1 \
+      || fail_apply_preflight "$state_file" "$job_id" "$version" "Required command is missing: $required_command"
+  done
+  mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$STAGING_DIR" \
+    || fail_apply_preflight "$state_file" "$job_id" "$version" "Unable to prepare the cloud installation directories."
   exec 9>"$INSTALL_ROOT/.update-operation.lock"
   flock -n 9 || die "Another installation or update is already running."
+  # Only the process that owns the update lock may remove the maintenance
+  # marker or publish terminal update state. A competing invocation exits
+  # above without disturbing the active maintainer.
+  trap apply_release_exit EXIT
   persist_installer
   prune_installation_artifacts
 
   local job_dir="$STAGING_DIR/$job_id" archive="$STAGING_DIR/$job_id/$asset_name"
   local extract_dir="$job_dir/extract" release_dir="$RELEASES_DIR/$version"
   local previous_target="" previous_version="" previous_process_version="" previous_ready_version="" runtime_was_running=0
-  local previous_guard_valid=0 reinstall_current=0 runtime_stopped=0
+  local previous_guard_valid=0 reinstall_current=0 runtime_stopped=0 first_managed_install=0
+  [[ -f "$INSTALL_ROOT/.cloud-install-root" ]] || first_managed_install=1
   previous_process_version="$(current_process_version)"
   previous_ready_version="$(current_health_version)"
   [[ -n "$previous_process_version" ]] && runtime_was_running=1
@@ -487,12 +629,27 @@ apply_release() {
     return 1
   fi
   if [[ -n "$previous_target" && "$previous_target" == "$release_dir" ]]; then
-    if [[ "$previous_ready_version" == "$version" ]]; then
+    if [[ "$previous_ready_version" == "$version" && "$previous_version" == "$version" && "$previous_guard_valid" == "1" ]]; then
+      install_guard_from_release "$previous_target"
+      if ! configure_supervisor; then
+        [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
+        write_status "$state_file" "$job_id" "failed" 100 "The release is healthy, but its supervisor could not be configured." "$version"
+        return 1
+      fi
+      if ! finalize_supervisor; then
+        [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
+        write_status "$state_file" "$job_id" "failed" 100 "The release is healthy, but its supervisor could not be enabled." "$version"
+        return 1
+      fi
       write_status "$state_file" "$job_id" "completed" 100 "This release is already active." "$version"
       return 0
     fi
     if [[ "$previous_version" == "$version" && "$previous_guard_valid" == "1" ]]; then
-      configure_supervisor
+      if ! configure_supervisor; then
+        [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
+        write_status "$state_file" "$job_id" "failed" 100 "The installed release is valid, but its supervisor could not be configured." "$version"
+        return 1
+      fi
       begin_maintenance
       install_guard_from_release "$previous_target"
       write_status "$state_file" "$job_id" "restarting" 88 "Restarting the verified installed release." "$version"
@@ -500,10 +657,16 @@ apply_release() {
       end_maintenance
       start_runtime "$runtime_was_running"
       if wait_for_version "$version" 80; then
+        if ! finalize_supervisor; then
+          [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
+          write_status "$state_file" "$job_id" "failed" 100 "The release is healthy, but its supervisor could not be enabled." "$version"
+          return 1
+        fi
         write_status "$state_file" "$job_id" "completed" 100 "The installed release was verified and restarted successfully." "$version"
         prune_installation_artifacts
         return 0
       fi
+      [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
       write_status "$state_file" "$job_id" "failed" 100 "The installed release is valid but did not become healthy after restart." "$version"
       return 1
     fi
@@ -566,6 +729,11 @@ apply_release() {
   end_maintenance
   start_runtime "$runtime_was_running"
   if wait_for_version "$version" 80; then
+    if ! finalize_supervisor; then
+      [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
+      write_status "$state_file" "$job_id" "failed" 100 "The release is healthy, but its supervisor could not be enabled." "$version"
+      return 1
+    fi
     write_status "$state_file" "$job_id" "completed" 100 "Update completed." "$version"
     rm -rf "$job_dir"
     prune_installation_artifacts
@@ -581,6 +749,10 @@ apply_release() {
     end_maintenance
     start_runtime 1
     if wait_for_version "$previous_version" 80; then
+      if ! finalize_supervisor; then
+        write_status "$state_file" "$job_id" "failed" 100 "The previous release recovered, but its supervisor could not be enabled." "$version"
+        return 1
+      fi
       write_status "$state_file" "$job_id" "rolled_back" 100 "New version failed readiness checks; previous version was verified and restored." "$version"
       prune_installation_artifacts
       return 1
@@ -588,6 +760,7 @@ apply_release() {
     write_status "$state_file" "$job_id" "failed" 100 "The new version failed and the previous version could not be restored safely." "$version"
     return 1
   fi
+  [[ "$first_managed_install" != "1" ]] || deactivate_failed_first_release
   write_status "$state_file" "$job_id" "failed" 100 "New version failed readiness checks and no verified previous version was available." "$version"
   return 1
 }
